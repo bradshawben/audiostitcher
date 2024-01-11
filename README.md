@@ -6,7 +6,7 @@ This has been (minimally) tested on OSX. Caveat emptor.
 
 1. `brew install ffmpeg`
 2. `brew install rubberband`
-3. `pip install -e requirements.txt`
+3. `pip install -r requirements.txt`
 4. `git clone https://github.com/bradshawben/audiostitcher.git`
 5. `cd audiostitcher`
 6. `streamlit run audiostitcher.py`
