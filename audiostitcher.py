@@ -1,75 +1,119 @@
-import streamlit as st
-import subprocess
+import os
 import re
+import subprocess
+import tempfile
 
-from pytube import YouTube
+import streamlit as st
+import yt_dlp
+
+st.title("Audio Stitcher")
+
+url = st.text_input("Enter a YouTube URL")
+
+if not url:
+    st.stop()
+
+st.video(url)
 
 
-st.title('Audio stitcher')
+@st.cache_data(show_spinner="Downloading audio from YouTube...")
+def download_audio(video_url):
+    tmp_dir = tempfile.mkdtemp(prefix="audiostitcher_")
+    ydl_opts = {
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "outtmpl": os.path.join(tmp_dir, "source.%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(video_url, download=True)
+        return ydl.prepare_filename(info), tmp_dir
 
-url = st.text_input('Select a youtube URL')
 
-if url:
-    try:
-        st.video(url)
-    except Exception as e:
-        st.error(f'Invalid url: {url}. Is this a valid Youtube video url?')
-        raise
+TIME_PATTERN = re.compile(r"^(?:(\d{1,2}):)?([0-5]?\d):([0-5]\d)$")
 
-    with st.expander("Get stitchin'", expanded=True):
+
+def validate_time(time_str):
+    """Validate and normalize a time string in MM:SS or HH:MM:SS format."""
+    match = TIME_PATTERN.match(time_str.strip())
+    if not match:
+        return None
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2))
+    seconds = int(match.group(3))
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+try:
+    source_path, tmp_dir = download_audio(url)
+except Exception as e:
+    st.error(f"Failed to download audio: {e}")
+    st.stop()
+
+with st.expander("Get stitchin'", expanded=True):
+    c1, c2 = st.columns(2)
+
+    with c1:
+        start = st.text_input("Start (MM:SS)", "00:00")
+        tempo = st.slider(
+            "Tempo", 0.5, 2.0, 1.0, 0.05,
+            help="1.0 = original speed, >1 = faster, <1 = slower",
+        )
+
+    with c2:
+        end = st.text_input("End (MM:SS)", "00:10")
+        loop = st.slider("Loops", 1, 10, 1, 1)
+
+    start_fmt = validate_time(start)
+    end_fmt = validate_time(end)
+
+    if not start_fmt:
+        st.warning(f'Invalid start time "{start}". Use MM:SS or HH:MM:SS format.')
+    if not end_fmt:
+        st.warning(f'Invalid end time "{end}". Use MM:SS or HH:MM:SS format.')
+
+    if not (start_fmt and end_fmt):
+        st.stop()
+
+    if st.button("Stitch!", type="primary"):
+        cut_path = os.path.join(tmp_dir, "cut.mp4")
+        looped_path = os.path.join(tmp_dir, "looped.wav")
+        output_path = os.path.join(tmp_dir, "output.wav")
 
         try:
-            yt = YouTube(url)
-        except Exception as e:
-            raise e
+            with st.spinner("Cutting audio segment..."):
+                subprocess.run(
+                    ["ffmpeg", "-i", source_path, "-ss", start_fmt,
+                     "-to", end_fmt, "-c", "copy", "-y", cut_path],
+                    capture_output=True, check=True,
+                )
 
-        path = (
-            yt.streams
-            .filter(only_audio=True).filter(file_extension='mp4')
-            .first()
-            .download(filename='raw_yt.mp4'))
+            with st.spinner("Looping and converting audio..."):
+                subprocess.run(
+                    ["ffmpeg", "-stream_loop", str(loop - 1), "-i", cut_path,
+                     "-ab", "160k", "-ac", "2", "-ar", "44100", "-vn",
+                     "-y", looped_path],
+                    capture_output=True, check=True,
+                )
 
-        c1, c2 = st.columns(2)
+            if tempo != 1.0:
+                with st.spinner("Adjusting tempo..."):
+                    scale = 1.0 / tempo
+                    subprocess.run(
+                        ["rubberband", "-t", str(scale),
+                         looped_path, output_path],
+                        capture_output=True, check=True,
+                    )
+            else:
+                output_path = looped_path
 
-        index_pattern = re.compile(r'^[0-9]{2}:[0-9]{2}$')
+            st.audio(output_path, format="audio/wav")
+            st.success("Done!")
 
-        with c1:
-            start = st.text_input('Start MM\:SS', '00:00')
-            tempo = st.slider('Tempo', 0.2, 1.0, 1.0, 0.05)
-
-            try:
-                assert index_pattern.match(start)
-            except:
-                st.warning('Start must be of the form "SS\:MM". Defaulting to 00:00.')
-                start = '00:00'
-
-        with c2:
-            end = st.text_input('End MM\\:SS', '00:10')
-            loop = st.slider('N Loops', 1, 10, 1, 1)
-
-            try:
-                assert index_pattern.match(end)
-            except:
-                st.warning('End must be of the form "SS\:MM". Defaulting to 00:10.')
-                end = '00:10'
-
-        # Cut the audio to the segment of interest
-        ffmpeg_cut = f"ffmpeg -i raw_yt.mp4 -c copy -ss 00:{start} -to 00:{end} -y cut.mp4"
-        subprocess.call(ffmpeg_cut, shell=True)
-
-        # Loop the audio the desired number of times
-        ffmpeg_loop = f'ffmpeg -stream_loop {int(loop)-1} -i cut.mp4 -c copy -y looped.mp4'
-        subprocess.call(ffmpeg_loop, shell=True)
-
-        # Scale to the desired tempo. Note a scale factor of X in Rubberband 
-        # implies the segment is X times longer: X < 1 is faster, X > 1 slower.
-        # It's more intuitive to have X < 1 imply a slower tempo.
-        scale = 2 - tempo
-        assert float(tempo)
-        ffmpeg_mp4_to_mp3 = "ffmpeg -i looped.mp4 -ab 160k -ac 2 -ar 44100 -vn -y looped.wav"
-        subprocess.call(ffmpeg_mp4_to_mp3, shell=True)
-
-        stretch = f'rubberband -t {scale} looped.wav scaled.wav'
-        subprocess.call(stretch, shell=True)
-
-        st.audio('scaled.wav', format="wav")
+        except subprocess.CalledProcessError as e:
+            st.error(f"Audio processing failed: {e.stderr.decode()}")
+        except FileNotFoundError as e:
+            st.error(
+                f"Required tool not found: {e}. "
+                "Ensure ffmpeg and rubberband-cli are installed."
+            )
